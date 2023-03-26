@@ -1,0 +1,2 @@
+KERNEL=="event*", MODE="660", GROUP="plugdev"
+KERNEL=="uinput", MODE="660", GROUP="plugdev"

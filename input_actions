@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+
+import argparse
+import contextlib
+import subprocess
+import threading
+
+import evdev
+import notify2
+import Xlib.X
+import Xlib.Xutil
+import Xlib.display
+import Xlib.Xatom
+import Xlib.ext.shape
+import Xlib.xobject.drawable
+import Xlib.ext.xtest
+import Xlib.protocol
+
+
+class MouseControlWindow:
+    def __init__(self, title: str, crosshair_color=0xFF0000):
+        # crosshair properties
+        self.title_h = 100
+        self.r_outer = 10
+        self.r_inner = 9
+
+        self.display = Xlib.display.Display()
+        screen = self.display.screen()
+        root: Xlib.xobject.drawable.Window = screen.root
+
+        self.WM_DELETE_WINDOW = self.display.intern_atom("WM_DELETE_WINDOW")
+        self.WM_PROTOCOLS = self.display.intern_atom("WM_PROTOCOLS")
+
+        if not self.display.has_extension("SHAPE"):
+            raise RuntimeError("X server does not have SHAPE extension")
+
+        # create the window background.
+        # this will define the color of everything that is not shape-masked,
+        # i.e. the crosshair.
+        bgpm = root.create_pixmap(1, 1, screen.root_depth)
+        bggc = root.create_gc(foreground=crosshair_color, background=screen.black_pixel)
+        bgpm.fill_rectangle(bggc, 0, 0, 1, 1)
+        bggc.free()
+
+        # We then create a window with the background pixel map from above (a red window)
+        w = h = 2 * self.r_outer + 2
+        self.window: Xlib.xobject.drawable.Window = root.create_window(
+            -1,
+            -1,
+            w,
+            h,
+            0,
+            screen.root_depth,
+            Xlib.X.InputOutput,
+            Xlib.X.CopyFromParent,
+            background_pixmap=bgpm,
+            event_mask=Xlib.X.StructureNotifyMask,
+            colormap=Xlib.X.CopyFromParent,
+        )
+        # Make sure the be notified of window destruction
+        self.window.set_wm_protocols([self.WM_DELETE_WINDOW])
+        self.window.set_wm_hints(
+            flags=Xlib.Xutil.StateHint, initial_state=Xlib.Xutil.NormalState
+        )
+
+        self.window.change_property(
+            self.display.intern_atom("_NET_WM_NAME"),
+            Xlib.Xatom.STRING,
+            8,
+            title.encode("utf-8"),
+        )
+        self.window.change_property(
+            self.display.intern_atom("_NET_WM_WINDOW_TYPE"),
+            Xlib.Xatom.ATOM,
+            32,
+            [
+                self.display.intern_atom("_NET_WM_WINDOW_TYPE_DIALOG"),
+            ],
+            Xlib.X.PropModeReplace,
+        )
+
+        self.window.set_wm_normal_hints(
+            flags=(Xlib.Xutil.PPosition | Xlib.Xutil.PSize | Xlib.Xutil.PMinSize),
+            min_width=w,
+            min_height=h,
+        )
+
+        # apply the window translucency mask
+        self.pos = 0, 0
+        self.prev_dim = None
+        self.update_mask(w, h)
+        self.window.shape_select_input(1)
+
+        # show the window
+        self.window.map()
+        self.display.flush()
+
+        # prepare bg thread
+        self.window_id = self.window.id
+        self.mutex = threading.Lock()
+        self.background_thread = threading.Thread(target=self.loop)
+
+    def update_pos(self, x, y, w, h):
+        with self.mutex:
+            self.pos = x + w // 2, y + h // 2
+
+    def update_mask(self, w, h):
+        if self.prev_dim == (w, h):
+            return
+        title_pm = self.window.create_pixmap(w, self.title_h + h // 2 + self.r_outer, 1)
+        gc = title_pm.create_gc(foreground=1, background=0)
+        # add the title bar to the mask
+        title_pm.fill_rectangle(gc, 0, 0, w, self.title_h)
+        # draw solid crosshair circle
+        title_pm.fill_arc(
+            gc,
+            w // 2 - self.r_outer,
+            h // 2 - self.r_outer + self.title_h,
+            2 * self.r_outer,
+            2 * self.r_outer,
+            0,
+            360 * 64,
+        )
+        # empty the crosshair circle
+        gc.change(foreground=0)
+        title_pm.fill_arc(
+            gc,
+            w // 2 - self.r_inner,
+            h // 2 - self.r_inner + self.title_h,
+            2 * self.r_inner,
+            2 * self.r_inner,
+            0,
+            360 * 64,
+        )
+        # draw crosshair bars
+        gc.change(foreground=1)
+        title_pm.fill_rectangle(
+            gc, w // 2, h // 2 - self.r_inner + self.title_h, 1, 2 * self.r_inner
+        )
+        title_pm.fill_rectangle(
+            gc, w // 2 - self.r_inner, h // 2 + self.title_h, 2 * self.r_inner, 1
+        )
+        # clear out crosshair bars
+        gc.change(foreground=0)
+        crosshair_gap = 5
+        title_pm.fill_arc(
+            gc,
+            w // 2 - self.r_inner + crosshair_gap,
+            h // 2 - self.r_inner + crosshair_gap + self.title_h,
+            2 * self.r_inner - 2 * crosshair_gap,
+            2 * self.r_inner - 2 * crosshair_gap,
+            0,
+            360 * 64,
+        )
+        gc.free()
+        self.window.shape_mask(
+            Xlib.ext.shape.SO.Set,
+            Xlib.ext.shape.SK.Bounding,
+            0,
+            -self.title_h,
+            title_pm,
+        )
+        self.prev_dim = w, h
+
+    def click(self):
+        with self.mutex:
+            if not self.running:
+                print("window is closed - cannot click")
+            pos = self.pos
+        display = Xlib.display.Display()
+        root = display.screen().root
+        root.warp_pointer(*pos)
+        display.sync()
+        Xlib.ext.xtest.fake_input(display, Xlib.X.ButtonPress, 1)
+        display.sync()
+        Xlib.ext.xtest.fake_input(display, Xlib.X.ButtonRelease, 1)
+        display.sync()
+        display.close()
+
+    def close(self):
+        with self.mutex:
+            if not self.running:
+                print("window is already closed")
+        display = Xlib.display.Display()
+        window = display.create_resource_object("window", self.window_id)
+        window.destroy()
+        display.close()
+
+    # Main loop, handling events
+    def loop(self):
+        try:
+            while True:
+                event = self.display.next_event()
+
+                if event.type == Xlib.X.ConfigureNotify:
+                    self.update_mask(event.width, event.height)
+                    self.update_pos(event.x, event.y, event.width, event.height)
+
+                # Window has been destroyed, quit
+                if event.type == Xlib.X.DestroyNotify:
+                    break
+
+                # Somebody wants to tell us something
+                elif event.type == Xlib.X.ClientMessage:
+                    if event.client_type == self.WM_PROTOCOLS:
+                        fmt, data = event.data
+                        if fmt == 32 and data[0] == self.WM_DELETE_WINDOW:
+                            break
+        finally:
+            with self.mutex:
+                self.running = False
+
+    def __enter__(self):
+        self.running = True
+        self.background_thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        self.background_thread.join()
+
+
+class Context(contextlib.ExitStack):
+    def __init__(self):
+        super().__init__()
+        self.notify2_initialized = False
+        self.uinput_instance = None
+
+    def get_uinput(self):
+        if self.uinput_instance is None:
+            self.uinput_instance = self.enter_context(evdev.uinput.UInput())
+        return self.uinput_instance
+
+    def get_notification(self, *args):
+        if not self.notify2_initialized:
+            notify2.init("input_actions")
+            self.notify2_initialized = True
+            self.callback(notify2.uninit)
+        return notify2.Notification(*args)
+
+
+class Action:
+    def invoke(self, down: bool):
+        raise NotImplementedError()
+
+
+class Print(Action):
+    def __init__(self, what):
+        self.what = what
+
+    def invoke(self, down):
+        print(f'{self.what}: {int(down)}')
+
+
+class Notify(Action):
+    def __init__(self, what, context: Context):
+        self.what = what
+        self.notification = context.get_notification(self.what, "0")
+        self.notification.timeout = 5000
+        self.counter = 0
+
+    def invoke(self, down):
+        if down:
+            self.counter += 1
+            self.notification.update(self.what, f"{self.counter} (pressed)")
+        else:
+            self.notification.update(self.what, f"{self.counter}")
+        self.notification.show()
+
+
+class Key(Action):
+    def __init__(self, key_code, context: Context):
+        self.uinput = context.get_uinput()
+        self.key_code = key_code
+        context.callback(self.invoke, False)
+
+    def invoke(self, down):
+        self.uinput.write(evdev.ecodes.EV_KEY, self.key_code, int(down))
+        self.uinput.syn()
+
+
+class Script(Action):
+    def __init__(self, path):
+        self.path = path
+
+    def invoke(self, down):
+        if down:
+            subprocess.call([self.path])
+
+
+class Mouse(Action):
+    def __init__(self, color: int, what: str, context: Context):
+        self.window = context.enter_context(MouseControlWindow(what, color))
+
+    def invoke(self, down):
+        if down:
+            self.window.click()
+
+
+class Quit(Action):
+    def invoke(self, down):
+        if down:
+            raise SystemExit()
+
+
+def lookup_key(name: str, error) -> int:
+    key_name = f"KEY_{name.upper()}"
+    try:
+        return getattr(evdev.ecodes, key_name)
+    except AttributeError:
+        error(f"unknown key name {key_name!r}")
+
+
+def parse_key_action(which: str, descriptor: str, error, context: Context) -> Action:
+    if descriptor == "notify":
+        return Notify(which, context)
+    if descriptor == "print":
+        return Print(which)
+    elif descriptor == "quit":
+        return Quit()
+    elif descriptor.startswith("key:"):
+        key_code = lookup_key(descriptor[4:], lambda x: error(f"{which!r}: {x}"))
+        return Key(key_code, context)
+    elif descriptor.startswith("mouse:"):
+        color_str = descriptor[6:]
+        try:
+            if len(color_str) != 6:
+                raise ValueError()
+            color = int(color_str, 16)
+        except ValueError:
+            error(f"{which!r}: color must be 6 hex characters in {descriptor!r}")
+        return Mouse(color, which, context)
+    elif descriptor.startswith("script:"):
+        return Script(descriptor[7:])
+    else:
+        error(f"{which!r}: unknown key action {descriptor!r}")
+
+
+def main():
+    with Context() as context:
+        cli = argparse.ArgumentParser()
+        cli.add_argument("input_path")
+        cli.add_argument("--key", nargs="+", action="append", default=[])
+        args = cli.parse_args()
+        key_actions = {}
+        for key in args.key:
+            name = key[0]
+            code = lookup_key(name, cli.error)
+            if code in key_actions:
+                cli.error(f"duplicate key {name!r}")
+            key_actions[code] = [
+                parse_key_action(f"key {name!r}", action, cli.error, context)
+                for action in key[1:]
+            ]
+
+        input = evdev.InputDevice(args.input_path)
+        input.grab()
+        for event in input.read_loop():
+            if event.type != evdev.ecodes.EV_KEY:
+                continue
+
+            if event.value == 1:
+                down = True
+            elif event.value == 0:
+                down = False
+            else:
+                continue
+
+            try:
+                actions = key_actions[event.code]
+            except KeyError:
+                continue
+
+            for action in actions:
+                action.invoke(down)
+
+
+if __name__ == "__main__":
+    main()
